@@ -3,550 +3,580 @@
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_VL53L0X.h>
+#include <driver/adc.h>   // doc ADC nhanh hon analogRead
 
 /*
-  Robot do line va giai me cung dung ESP32
-  - 8 cam bien line analog: gia tri < threshold la den, > threshold la trang
-  - DRV8833 dieu khien 2 motor DC
-  - MPU6050 doc gyro Z de ho tro giu huong va re goc
-  - 3 VL53L0X dung chung I2C, tach dia chi bang chan XSHUT
+  Robot do line Cascade PD + Gyro P
+  Phuong phap: cascade nhu code mau - line PD tinh target turn rate,
+               gyro P bu sai so turn rate thuc, cho phan hoi nhanh + on dinh.
 
-  Luu y:
-  - Hay sua lai cac chan ben duoi theo mach that.
-  - ESP32 ADC1 gom GPIO 32-39. Neu co the, nen uu tien ADC1 cho cam bien analog.
+  Phan cung:
+    - ESP32 + DRV8833 (STBY noi 3V3)
+    - 8 cam bien line analog (trai->phai: GPIO36,39,34,35,32,33,25,26)
+    - MPU6050 I2C (SDA=21, SCL=22)
+    - 3x VL53L0X XSHUT (trai=17, truoc=16, phai=23) cho maze
 */
 
-// ===================== KHAI BAO CHAN DE TU CHINH =====================
+// ================================================================
+//  CHAN - SUA THEO MACH THAT
+// ================================================================
 
-// I2C cho MPU6050 va VL53L0X
-const int I2C_SDA_PIN = 21;
-const int I2C_SCL_PIN = 22;
+const int SDA_PIN = 21;
+const int SCL_PIN = 22;
 
-// 8 cam bien line analog, tu trai sang phai
-const int NUM_LINE_SENSORS = 8;
-const int linePins[NUM_LINE_SENSORS] = {
-  36, 39, 34, 35, 32, 33, 25, 26
-};
+// 8 cam bien line: thu tu TU TRAI SANG PHAI khi nhin theo chieu xe chay
+const int NUM_SENSORS = 8;
+const int sensorPins[NUM_SENSORS] = { 36, 39, 34, 35, 32, 33, 25, 26 };
 
-// Threshold rieng tung cam bien, can calib thuc te
-int lineThresholds[NUM_LINE_SENSORS] = {
-  2000, 2000, 2000, 2000, 2000, 2000, 2000, 2000
-};
+// Nguong rieng tung cam bien (chinh thuc te qua Serial)
+// Gia tri analogRead < threshold = MAU DEN (detect line)
+int thresholds[NUM_SENSORS] = { 2000, 2000, 2000, 2000, 2000, 2000, 2000, 2000 };
 
-// DRV8833
-const int MOTOR_STBY_PIN = 23;
+// DRV8833 (STBY -> 3V3, khong can pin dieu khien)
+const int L_IN1 = 18;   // Motor trai
+const int L_IN2 = 19;
+const int R_IN1 = 27;   // Motor phai
+const int R_IN2 = 14;
 
-const int LEFT_AIN1_PIN = 16;
-const int LEFT_AIN2_PIN = 17;
-const int RIGHT_BIN1_PIN = 18;
-const int RIGHT_BIN2_PIN = 19;
+// VL53L0X XSHUT cho maze
+const int XSHUT_L = 17;
+const int XSHUT_F = 16;
+const int XSHUT_R = 23;
+const uint8_t ADDR_L = 0x30;
+const uint8_t ADDR_F = 0x31;
+const uint8_t ADDR_R = 0x32;
 
-// PWM ESP32
-const int PWM_FREQ = 20000;
-const int PWM_RESOLUTION = 8;
-const int PWM_LEFT_IN1_CH = 0;
-const int PWM_LEFT_IN2_CH = 1;
-const int PWM_RIGHT_IN1_CH = 2;
-const int PWM_RIGHT_IN2_CH = 3;
+// *** CHAN CHON CHE DO ***
+// D4 (GPIO4): dung INPUT_PULLUP
+//   - Cam jumper/day tu D4 xuong GND  -> LOC (DO LINE)
+//   - Rut day ra, pin thả nổi -> HIGH  -> MAZE (GIAI ME CUNG)
+const int MODE_PIN = 4;
 
-// XSHUT cua 3 cam bien VL53L0X
-const int VL53_LEFT_XSHUT_PIN = 13;
-const int VL53_FRONT_XSHUT_PIN = 14;
-const int VL53_RIGHT_XSHUT_PIN = 27;
+// ================================================================
+//  THAM SO DIEU KHIEN - chinh o day
+// ================================================================
 
-// Dia chi I2C moi cho tung VL53L0X
-const uint8_t VL53_LEFT_ADDR = 0x30;
-const uint8_t VL53_FRONT_ADDR = 0x31;
-const uint8_t VL53_RIGHT_ADDR = 0x32;
+// --- Cascade PD (line) + Gyro P (rate) ---
+// lineKp/lineKd: quy doi error vi tri (don vi: 0..3500) -> target turn rate (rad/s)
+// gyroKp:        quy doi sai so turn rate -> PWM correction
+float lineKp = 0.0021f;
+float lineKd = 0.0075f;
+float gyroKp = 65.0f;     // giam tu 72 -> tranh over-correction
 
-// ===================== THAM SO DIEU KHIEN =====================
+// --- Toc do ---
+int fullSpeed   = 255;
+int fastSpeed   = 255;
+int midSpeed    = 255;
+int curveSpeed  = 255;
+int sharpSpeed  = 255;
 
-// Line following
-int baseSpeedLine = 130;
-float lineKp = 0.060f;
-float lineKd = 0.850f;
-float straightGyroKp = 2.0f;   // ho tro giu huong khi line error gan 0
+int currentSpeed  = 255;
+int speedStepUp   = 255;
+int speedStepDown = 60;   // phanh manh hon
 
-// Maze
-int baseSpeedMaze = 120;
-int turnSpeedMaze = 115;
-const int WALL_DISTANCE_MM = 170;       // nho hon nguong nay xem la co tuong/vat can
-const int FRONT_CLEAR_DISTANCE_MM = 190;
-const unsigned long MAZE_FORWARD_MS = 280;
+// --- Loc EMA cho error ---
+float filteredError = 0.0f;
+float errorAlpha    = 1.0f;  // 1.0 = khong loc, phan hoi NGAY LAP TUC voi moi thay doi
 
-// Debug
-const unsigned long DEBUG_INTERVAL_MS = 150;
+// --- Tim line khi mat ---
+int searchBackSpeed = 255; // lui max de tim lai line khi bi qua vach
+const unsigned long SEARCH_BACK_MS = 400;
 
-// ===================== BIEN TOAN CUC =====================
+// --- Maze ---
+bool mazeEnabled = false;  // doi sang true khi san sang test maze
+int  baseMazeSpeed   = 153;
+int  turnMazeSpeed   = 140;
 
-enum RobotMode {
-  LINE_FOLLOW_MODE,
-  MAZE_SOLVE_MODE
-};
+// --- Nguong cam bien maze ---
+// Cam bien TRAI va PHAI gac 45° so voi truc xe:
+//   Layout (nhin tu tren):   L\  /R
+//                              [F]
+// Khi co tuong ca 2 phia, cam bien 45° doc duong cheo:
+//   d_sensor = d_wall / cos(45deg) = d_wall * 1.414
+// => Nguong cho cam bien 45° phai lon hon ~1.4x cam bien thang
+// WALL_DIAG_MM: nguong de phat hien "co lo" phia trai/phai (chinh theo thuc te)
+const int WALL_DIAG_MM = 280;  // cam bien 45°: > nguong nay = co khoang mo o goc 45°
+const int FRONT_MM     = 180;  // cam bien thang truoc: > nguong nay = duong truoc thong
+const int CRASH_MM     =  80;  // dung khan cap neu vat qua gan phia truoc
+const float WALL_KP    = 0.15f; // he so chinh lane dung cam bien 45°
+const unsigned long MAZE_FWD_MS = 280;
 
-RobotMode currentMode = LINE_FOLLOW_MODE;
-
+// ================================================================
+//  BIEN TOAN CUC
+// ================================================================
 Adafruit_MPU6050 mpu;
-Adafruit_VL53L0X vl53Left;
-Adafruit_VL53L0X vl53Front;
-Adafruit_VL53L0X vl53Right;
+Adafruit_VL53L0X vl53L, vl53F, vl53R;
 
-bool mpuReady = false;
+bool mpuReady  = false;
 bool vl53Ready = false;
 
-int lineValues[NUM_LINE_SENSORS];
-bool lineIsBlack[NUM_LINE_SENSORS];
+bool sensorBlack[NUM_SENSORS];
+bool lineDetected  = false;
+int  lastError     = 0;
 
-float lastLineError = 0.0f;
-float targetHeadingDeg = 0.0f;
-float currentHeadingDeg = 0.0f;
-float gyroZOffsetRad = 0.0f;
-unsigned long lastGyroUpdateMs = 0;
-unsigned long lastDebugMs = 0;
+float gyroZOffset = 0.0f;
 
-// ===================== KHAI BAO HAM =====================
+enum RobotMode { LINE_FOLLOW, MAZE_SOLVE };
+RobotMode mode = LINE_FOLLOW;
 
-void setupMotors();
-void setMotorLeft(int speed);
-void setMotorRight(int speed);
-void setMotors(int leftSpeed, int rightSpeed);
-void stopMotors();
+// --- Cache gyro ---
+float cachedGyroZ  = 0.0f;
+int   gyroSkipCnt  = 0;       // doc gyro moi 3 loop de tang tan so quet sensor
 
-bool setupVL53L0X();
-int readDistanceMM(Adafruit_VL53L0X &sensor);
-void readMazeDistances(int &leftMM, int &frontMM, int &rightMM);
+// ================================================================
+//  MOTOR - DRV8833
+// ================================================================
+void setupMotors() {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  // Arduino ESP32 v3+: analogWrite tren bat ky chan nao
+  pinMode(L_IN1, OUTPUT); pinMode(L_IN2, OUTPUT);
+  pinMode(R_IN1, OUTPUT); pinMode(R_IN2, OUTPUT);
+#else
+  ledcSetup(0, 20000, 8); ledcAttachPin(L_IN1, 0);
+  ledcSetup(1, 20000, 8); ledcAttachPin(L_IN2, 1);
+  ledcSetup(2, 20000, 8); ledcAttachPin(R_IN1, 2);
+  ledcSetup(3, 20000, 8); ledcAttachPin(R_IN2, 3);
+#endif
+}
 
-bool setupMPU6050();
-void calibrateGyroZ();
-void updateGyroHeading();
-void resetHeading(float headingDeg = 0.0f);
+void writeMotor(int in1, int in2, int ch1, int ch2, int speed) {
+  speed = constrain(speed, -255, 255);
+  int a = (speed > 0) ? speed : 0;
+  int b = (speed < 0) ? -speed : 0;
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  analogWrite(in1, a);
+  analogWrite(in2, b);
+#else
+  ledcWrite(ch1, a);
+  ledcWrite(ch2, b);
+#endif
+}
 
-void readLineSensors();
-float calculateLineError();
-bool allSensorsBlack();
-void followLine();
+// speed > 0 = tien, speed < 0 = lui
+void setMotorLeft(int speed)  { writeMotor(L_IN1, L_IN2, 0, 1, speed); }
+void setMotorRight(int speed) { writeMotor(R_IN1, R_IN2, 2, 3, speed); }
 
-void solveMaze();
-void goForwardMaze();
-void turnLeft90();
-void turnRight90();
-void turnAround180();
-void turnByDegrees(float degrees);
+void setMotors(int l, int r) { setMotorLeft(l); setMotorRight(r); }
+void stopMotors()             { setMotorLeft(0); setMotorRight(0); }
 
-void printLineDebug();
-void printModeDebug();
+// ================================================================
+//  GYRO
+// ================================================================
+void calibrateGyro() {
+  Serial.println("Calibrating gyro... giu robot dung yen");
+  float sum = 0;
+  const int N = 500;
+  for (int i = 0; i < N; i++) {
+    sensors_event_t a, g, t;
+    mpu.getEvent(&a, &g, &t);
+    sum += g.gyro.z;
+    delay(2);
+  }
+  gyroZOffset = sum / N;
+  Serial.printf("gyroZOffset = %.6f\n", gyroZOffset);
+}
 
-// ===================== SETUP / LOOP =====================
+float readGyroZ() {
+  sensors_event_t a, g, t;
+  mpu.getEvent(&a, &g, &t);
+  return g.gyro.z - gyroZOffset; // rad/s
+}
 
+// ================================================================
+//  CAM BIEN LINE
+// ================================================================
+/*
+  ADC channel map cho ESP32 ADC1 (dung adc1_get_raw thay analogRead, nhanh hon ~3x):
+  GPIO36=ADC1_CH0, GPIO39=ADC1_CH3, GPIO34=ADC1_CH6, GPIO35=ADC1_CH7
+  GPIO32=ADC1_CH4, GPIO33=ADC1_CH5, GPIO25=ADC1_CH8(*), GPIO26=ADC1_CH9(*)
+  (*) GPIO25/26 la ADC2 nen van dung analogRead cho 2 sensor cuoi
+*/
+static const adc1_channel_t adc1ch[6] = {
+  ADC1_CHANNEL_0,  // GPIO36
+  ADC1_CHANNEL_3,  // GPIO39
+  ADC1_CHANNEL_6,  // GPIO34
+  ADC1_CHANNEL_7,  // GPIO35
+  ADC1_CHANNEL_4,  // GPIO32
+  ADC1_CHANNEL_5,  // GPIO33
+};
+
+void setupADC() {
+  adc1_config_width(ADC_WIDTH_BIT_12);
+  for (int i = 0; i < 6; i++)
+    adc1_config_channel_atten(adc1ch[i], ADC_ATTEN_DB_12); // 0..3.3V, DB_11 deprecated
+}
+
+int fastRead(int sensorIdx) {
+  if (sensorIdx < 6) return adc1_get_raw(adc1ch[sensorIdx]);
+  return analogRead(sensorPins[sensorIdx]);
+}
+
+int readLineError() {
+  long weightedSum = 0;
+  int  activeCount = 0;
+
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    int val = fastRead(i);
+    sensorBlack[i] = (val < thresholds[i]);
+    if (sensorBlack[i]) {
+      weightedSum += (long)i * 1000;
+      activeCount++;
+    }
+  }
+
+  lineDetected = (activeCount > 0);
+
+  if (lineDetected) {
+    int position = (int)(weightedSum / activeCount);
+    int err = position - 3500;
+
+    return err;
+  }
+
+  return lastError; // giu error cu khi mat line
+}
+
+int countBlack() {
+  int n = 0;
+  for (int i = 0; i < NUM_SENSORS; i++) if (sensorBlack[i]) n++;
+  return n;
+}
+
+// ================================================================
+//  PHAT HIEN GOC VUONG BANG PATTERN
+//  Nhan biet ngay khi >= 3 sensor CANH cung den
+//  (xuat hien TRUOC KHI error tang du cao)
+// ================================================================
+bool isSharpCornerPattern() {
+  // Canh trai: sensor 0,1,2 - neu >= 2 trong so 3 sensor nay den
+  // VA cac sensor ben phai (5,6,7) khong den -> goc trai
+  int leftEdge  = (int)sensorBlack[0] + sensorBlack[1] + sensorBlack[2];
+  int rightEdge = (int)sensorBlack[5] + sensorBlack[6] + sensorBlack[7];
+  int centerOn  = (int)sensorBlack[3] + sensorBlack[4];
+
+  // Goc trai: it nhat 2/3 sensor trai den, trung tam khong den
+  if (leftEdge >= 2 && centerOn == 0 && rightEdge == 0) return true;
+  // Goc phai: it nhat 2/3 sensor phai den, trung tam khong den
+  if (rightEdge >= 2 && centerOn == 0 && leftEdge == 0) return true;
+  return false;
+}
+
+// ================================================================
+//  DYNAMIC SPEED
+// ================================================================
+void rampSpeedTo(int target) {
+  if (currentSpeed < target) {
+    currentSpeed = min(currentSpeed + speedStepUp,   target);
+  } else if (currentSpeed > target) {
+    currentSpeed = max(currentSpeed - speedStepDown, target);
+  }
+}
+
+int getTargetSpeed(int absError) {
+  bool centerBoth = sensorBlack[3] && sensorBlack[4];
+  if (centerBoth && absError < 600)  return fullSpeed;  // thang hop
+  if (absError < 1100)               return fastSpeed;  // lech nhe
+  if (absError < 2000)               return midSpeed;   // cua vua
+  if (absError < 2800)               return curveSpeed; // cua gat
+  return sharpSpeed;                                    // GOC VUONG 90 do
+}
+
+// ================================================================
+//  TIM LINE KHI MAT - BLOCKING
+//  Khi mat line, khong xoay theo raw error cuoi nua.
+//  Lui thang mot doan ngan de dua day sensor ve lai vach vua bi vuot qua.
+// ================================================================
+void searchLine() {
+  Serial.println("[SEARCH] backtrack");
+
+  unsigned long t0 = millis();
+  while (millis() - t0 < SEARCH_BACK_MS) {
+    readLineError();
+    if (lineDetected) goto done;
+    setMotors(-searchBackSpeed, -searchBackSpeed);
+  }
+
+  Serial.println("[SEARCH] NOT FOUND");
+  stopMotors(); delay(200);
+  return;
+
+done:
+  Serial.println("[SEARCH] FOUND");
+  stopMotors(); delay(30);
+  filteredError = 0.0f;
+  lastError     = 0;
+  currentSpeed  = sharpSpeed;
+}
+
+void resetSearch() {}
+
+// ================================================================
+//  FOLLOW LINE - CASCADE PD + GYRO P
+// ================================================================
+void followLineCascade() {
+  // Doc gyro moi 3 loop thay vi moi loop -> tang tan so quet sensor ~3x
+  gyroSkipCnt++;
+  if (gyroSkipCnt >= 3) {
+    gyroSkipCnt = 0;
+    if (mpuReady) {
+      sensors_event_t a, g, t;
+      mpu.getEvent(&a, &g, &t);
+      cachedGyroZ = g.gyro.z - gyroZOffset;
+    }
+  }
+
+  int rawError = readLineError();
+
+  if (!lineDetected) {
+    searchLine();
+    return;
+  }
+
+  // EMA filter
+  filteredError = filteredError * (1.0f - errorAlpha) + rawError * errorAlpha;
+  int error      = (int)filteredError;
+  int derivative = error - lastError;
+  int absError   = abs(error);
+  int absRaw     = abs(rawError);
+
+  // Toc do theo error - ramp binh thuong
+  rampSpeedTo(getTargetSpeed(absRaw));
+
+  // --- Cascade PD -> target turn rate ---
+  float targetTurnRate = lineKp * error + lineKd * derivative;
+  targetTurnRate = constrain(targetTurnRate, -3.8f, 3.8f);
+
+  // --- Gyro P ---
+  float turnErr  = targetTurnRate + cachedGyroZ;
+  int correction = (int)(gyroKp * turnErr);
+
+  // Gioi han correction - CHAT HON de tranh over-correction o goc vuong
+  if      (absError > 2600) correction = constrain(correction, -180, 180);
+  else if (absError > 1900) correction = constrain(correction, -145, 145);
+  else if (absError > 1200) correction = constrain(correction, -115, 115);
+  else                      correction = constrain(correction,  -95,  95);
+
+  int leftSpeed  = currentSpeed + correction;
+  int rightSpeed = currentSpeed - correction;
+
+  int brakeLow = (absError > 2800) ? -200 : (absError > 1800 ? -130 : -80);
+  leftSpeed  = constrain(leftSpeed,  brakeLow, 255);
+  rightSpeed = constrain(rightSpeed, brakeLow, 255);
+
+  setMotorLeft(leftSpeed);
+  setMotorRight(rightSpeed);
+
+  lastError = error;
+}
+
+// ================================================================
+//  VL53L0X
+// ================================================================
+bool setupVL53L0X() {
+  pinMode(XSHUT_L, OUTPUT); pinMode(XSHUT_F, OUTPUT); pinMode(XSHUT_R, OUTPUT);
+  digitalWrite(XSHUT_L, LOW); digitalWrite(XSHUT_F, LOW); digitalWrite(XSHUT_R, LOW);
+  delay(20);
+
+  digitalWrite(XSHUT_L, HIGH); delay(20);
+  if (!vl53L.begin(ADDR_L, false, &Wire)) { Serial.println("[LOI] VL53 TRAI"); return false; }
+
+  digitalWrite(XSHUT_F, HIGH); delay(20);
+  if (!vl53F.begin(ADDR_F, false, &Wire)) { Serial.println("[LOI] VL53 TRUOC"); return false; }
+
+  digitalWrite(XSHUT_R, HIGH); delay(20);
+  if (!vl53R.begin(ADDR_R, false, &Wire)) { Serial.println("[LOI] VL53 PHAI"); return false; }
+
+  Serial.println("[OK] 3x VL53L0X ready");
+  return true;
+}
+
+int readMM(Adafruit_VL53L0X &s) {
+  VL53L0X_RangingMeasurementData_t m;
+  s.rangingTest(&m, false);
+  return (m.RangeStatus == 4) ? 8190 : (int)m.RangeMilliMeter;
+}
+
+// ================================================================
+//  MAZE SOLVER - cam bien 45 do
+//
+//  Bo tri cam bien (nhin tu tren):
+//
+//       L (45°)\     /(45°) R
+//                \ /
+//               [===]  <-- F (thang truoc)
+//
+//  Nguyen tac Left-Hand Rule:
+//    Uu tien re TRAI > di THANG > re PHAI > QUAY DAU
+//
+//  Tai mot nga tu:
+//    - Cam bien 45° trai nhin vao hanh lang trai -> doc rat xa (> WALL_DIAG_MM)
+//    - Cam bien 45° phai nhin vao hanh lang phai -> doc rat xa (> WALL_DIAG_MM)
+//    - Cam bien truoc: phat hien tuong thang truoc (< FRONT_MM = bi chan)
+//
+//  Trong hanh lang thang:
+//    - Ca L va R doc ngan (bi tuong 2 ben chan o goc 45°)
+//    - Dung chenh lech L/R de chinh lane (wall-centering)
+// ================================================================
+float headingDeg     = 0.0f;
+unsigned long lastGyroUs = 0;
+
+void updateHeading() {
+  unsigned long now = micros();
+  static unsigned long last = 0;
+  if (last == 0) { last = now; return; }
+  float dt = (now - last) * 1e-6f;
+  last = now;
+  sensors_event_t a, g, t;
+  mpu.getEvent(&a, &g, &t);
+  headingDeg += (g.gyro.z - gyroZOffset) * 57.2957795f * dt;
+}
+
+void resetHeading() { headingDeg = 0.0f; lastGyroUs = micros(); }
+
+// Quay tai cho dung deg do (am = trai, duong = phai)
+// Giam toc khi con < 20° de khong vuot qua
+void turnByDeg(float deg) {
+  resetHeading();
+  int dir = (deg > 0) ? 1 : -1;
+  float target = fabsf(deg);
+  unsigned long start = millis();
+  while (fabsf(headingDeg) < target && millis() - start < 3000) {
+    updateHeading();
+    int spd = (target - fabsf(headingDeg) < 20.0f) ? 65 : turnMazeSpeed;
+    setMotors(dir * spd, -dir * spd);
+    delay(3);
+  }
+  stopMotors(); delay(100); resetHeading();
+}
+
+// Tien thang 1 buoc, dung 2 tang chinh huong:
+//   1. Gyro P: giu huong khong xoay
+//   2. Wall centering: can bang L/R de di giua hanh lang
+void mazeFwd() {
+  resetHeading();
+  unsigned long start = millis();
+  while (millis() - start < MAZE_FWD_MS) {
+    updateHeading();
+    if (readMM(vl53F) < CRASH_MM) break;  // dung khan cap
+
+    // Tang 1: chinh thang bang gyro (chong xoay)
+    float gyroCorr = headingDeg * 1.5f;
+
+    // Tang 2: wall-centering bang cam bien 45°
+    // Chi ap dung khi ca 2 cam bien thay tuong (trong hanh lang, khong tai nga tu)
+    int lMM = readMM(vl53L);
+    int rMM = readMM(vl53R);
+    float wallCorr = 0.0f;
+    if (lMM < WALL_DIAG_MM && rMM < WALL_DIAG_MM) {
+      // lMM < rMM: robot lech sang phai (gan tuong phai) -> can sang trai
+      // lMM > rMM: robot lech sang trai (gan tuong trai) -> can sang phai
+      wallCorr = (float)(lMM - rMM) * WALL_KP;
+    }
+
+    float totalCorr = gyroCorr + wallCorr;
+    setMotors(baseMazeSpeed - (int)totalCorr,
+              baseMazeSpeed + (int)totalCorr);
+    delay(4);
+  }
+  stopMotors(); delay(80);
+}
+
+// Quyet dinh huong di tai moi buoc (Left-Hand Rule)
+void solveMaze() {
+  if (!vl53Ready) { stopMotors(); delay(300); return; }
+
+  int l = readMM(vl53L);
+  int f = readMM(vl53F);
+  int r = readMM(vl53R);
+  Serial.printf("[MAZE] L=%d F=%d R=%d | thresh_diag=%d front=%d\n",
+                l, f, r, WALL_DIAG_MM, FRONT_MM);
+
+  // LEFT-HAND RULE voi cam bien 45°:
+  // Cam bien 45° trai doc xa -> hanh lang trai mo -> re trai
+  if (l > WALL_DIAG_MM) {
+    Serial.println("[MAZE] -> RE TRAI");
+    turnByDeg(-90);
+    mazeFwd();
+  }
+  // Truoc thong -> tien thang
+  else if (f > FRONT_MM) {
+    Serial.println("[MAZE] -> THANG");
+    mazeFwd();
+  }
+  // Cam bien 45° phai doc xa -> hanh lang phai mo -> re phai
+  else if (r > WALL_DIAG_MM) {
+    Serial.println("[MAZE] -> RE PHAI");
+    turnByDeg(90);
+    mazeFwd();
+  }
+  // Bit ca 3 huong -> quay dau
+  else {
+    Serial.println("[MAZE] -> QUAY DAU");
+    turnByDeg(180);
+  }
+}
+
+// ================================================================
+//  SETUP / LOOP
+// ================================================================
 void setup() {
   Serial.begin(115200);
-  delay(300);
+  delay(1000);
 
-  analogReadResolution(12); // ESP32: 0..4095
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(800000); // 800kHz: nhanh hon 2x, MPU6050 ho tro den 1MHz
+
+  if (!mpu.begin(0x68, &Wire)) {
+    Serial.println("MPU6050 NOT FOUND!");
+  } else {
+    Serial.println("MPU6050 CONNECTED!");
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+    calibrateGyro();
+    mpuReady = true;
+  }
+
+  for (int i = 0; i < NUM_SENSORS; i++) pinMode(sensorPins[i], INPUT);
+
+  // Cau hinh chan chon che do: pull-up noi, cam GND = LINE, rut ra = MAZE
+  pinMode(MODE_PIN, INPUT_PULLUP);
 
   setupMotors();
-  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  setupADC(); // khoi tao ADC1 nhanh cho 6 sensor dau
 
-  mpuReady = setupMPU6050();
-  if (!mpuReady) {
-    Serial.println("LOI: Khong tim thay MPU6050. Kiem tra day noi/I2C.");
-  } else {
-    calibrateGyroZ();
-    resetHeading(0.0f);
-  }
-
+  // VL53L0X chi can khi maze bat (init de san sang)
   vl53Ready = setupVL53L0X();
-  if (!vl53Ready) {
-    Serial.println("LOI: Khoi tao VL53L0X that bai. Robot van co the do line.");
-  }
+  if (!vl53Ready) Serial.println("[WARN] VL53 loi, chi chay line mode");
 
-  Serial.println("San sang. Mode ban dau: LINE_FOLLOW_MODE");
+  analogReadResolution(12);
+
+  // Doc trang thai ban dau cua MODE_PIN
+  mode = (digitalRead(MODE_PIN) == LOW) ? LINE_FOLLOW : MAZE_SOLVE;
+  Serial.printf("[BOOT] MODE_PIN=D4 -> %s\n",
+                mode == LINE_FOLLOW ? "LINE_FOLLOW" : "MAZE_SOLVE");
+  Serial.println("=== START ===");
+  Serial.printf("lineKp=%.5f lineKd=%.5f gyroKp=%.1f\n", lineKp, lineKd, gyroKp);
+  delay(500);
 }
 
 void loop() {
-  updateGyroHeading();
+  // Cập nhật mode theo trang thai chan D4 (real-time)
+  RobotMode newMode = (digitalRead(MODE_PIN) == LOW) ? LINE_FOLLOW : MAZE_SOLVE;
+  if (newMode != mode) {
+    mode = newMode;
+    stopMotors();
+    filteredError = 0.0f;
+    lastError     = 0;
+    Serial.printf("[MODE] Chuyen sang: %s\n",
+                  mode == LINE_FOLLOW ? "LINE_FOLLOW" : "MAZE_SOLVE");
+    delay(200); // chong nhieu tiep xuc
+  }
 
-  if (currentMode == LINE_FOLLOW_MODE) {
-    readLineSensors();
-    followLine();
-
-    if (allSensorsBlack()) {
-      stopMotors();
-      Serial.println("Tat ca 8 mat thay mau den -> Chuyen sang MAZE_SOLVE_MODE");
-      delay(300);
-      resetHeading(0.0f);
-      currentMode = MAZE_SOLVE_MODE;
-    }
+  if (mode == LINE_FOLLOW) {
+    followLineCascade();
   } else {
     solveMaze();
   }
-
-  if (millis() - lastDebugMs >= DEBUG_INTERVAL_MS) {
-    lastDebugMs = millis();
-    printModeDebug();
-    printLineDebug();
-  }
 }
 
-// ===================== MOTOR DRV8833 =====================
-
-void setupMotors() {
-  pinMode(MOTOR_STBY_PIN, OUTPUT);
-  digitalWrite(MOTOR_STBY_PIN, HIGH);
-
-  ledcSetup(PWM_LEFT_IN1_CH, PWM_FREQ, PWM_RESOLUTION);
-  ledcSetup(PWM_LEFT_IN2_CH, PWM_FREQ, PWM_RESOLUTION);
-  ledcSetup(PWM_RIGHT_IN1_CH, PWM_FREQ, PWM_RESOLUTION);
-  ledcSetup(PWM_RIGHT_IN2_CH, PWM_FREQ, PWM_RESOLUTION);
-
-  ledcAttachPin(LEFT_AIN1_PIN, PWM_LEFT_IN1_CH);
-  ledcAttachPin(LEFT_AIN2_PIN, PWM_LEFT_IN2_CH);
-  ledcAttachPin(RIGHT_BIN1_PIN, PWM_RIGHT_IN1_CH);
-  ledcAttachPin(RIGHT_BIN2_PIN, PWM_RIGHT_IN2_CH);
-
-  stopMotors();
-}
-
-void setMotorLeft(int speed) {
-  speed = constrain(speed, -255, 255);
-
-  if (speed > 0) {
-    ledcWrite(PWM_LEFT_IN1_CH, speed);
-    ledcWrite(PWM_LEFT_IN2_CH, 0);
-  } else if (speed < 0) {
-    ledcWrite(PWM_LEFT_IN1_CH, 0);
-    ledcWrite(PWM_LEFT_IN2_CH, -speed);
-  } else {
-    ledcWrite(PWM_LEFT_IN1_CH, 0);
-    ledcWrite(PWM_LEFT_IN2_CH, 0);
-  }
-}
-
-void setMotorRight(int speed) {
-  speed = constrain(speed, -255, 255);
-
-  if (speed > 0) {
-    ledcWrite(PWM_RIGHT_IN1_CH, speed);
-    ledcWrite(PWM_RIGHT_IN2_CH, 0);
-  } else if (speed < 0) {
-    ledcWrite(PWM_RIGHT_IN1_CH, 0);
-    ledcWrite(PWM_RIGHT_IN2_CH, -speed);
-  } else {
-    ledcWrite(PWM_RIGHT_IN1_CH, 0);
-    ledcWrite(PWM_RIGHT_IN2_CH, 0);
-  }
-}
-
-void setMotors(int leftSpeed, int rightSpeed) {
-  digitalWrite(MOTOR_STBY_PIN, HIGH);
-  setMotorLeft(leftSpeed);
-  setMotorRight(rightSpeed);
-}
-
-void stopMotors() {
-  setMotorLeft(0);
-  setMotorRight(0);
-}
-
-// ===================== VL53L0X =====================
-
-bool setupVL53L0X() {
-  pinMode(VL53_LEFT_XSHUT_PIN, OUTPUT);
-  pinMode(VL53_FRONT_XSHUT_PIN, OUTPUT);
-  pinMode(VL53_RIGHT_XSHUT_PIN, OUTPUT);
-
-  // Tat tat ca cam bien de tranh trung dia chi 0x29
-  digitalWrite(VL53_LEFT_XSHUT_PIN, LOW);
-  digitalWrite(VL53_FRONT_XSHUT_PIN, LOW);
-  digitalWrite(VL53_RIGHT_XSHUT_PIN, LOW);
-  delay(20);
-
-  // Bat tung cam bien va gan dia chi rieng
-  digitalWrite(VL53_LEFT_XSHUT_PIN, HIGH);
-  delay(20);
-  if (!vl53Left.begin(VL53_LEFT_ADDR, false, &Wire)) {
-    Serial.println("VL53L0X trai loi");
-    return false;
-  }
-
-  digitalWrite(VL53_FRONT_XSHUT_PIN, HIGH);
-  delay(20);
-  if (!vl53Front.begin(VL53_FRONT_ADDR, false, &Wire)) {
-    Serial.println("VL53L0X truoc loi");
-    return false;
-  }
-
-  digitalWrite(VL53_RIGHT_XSHUT_PIN, HIGH);
-  delay(20);
-  if (!vl53Right.begin(VL53_RIGHT_ADDR, false, &Wire)) {
-    Serial.println("VL53L0X phai loi");
-    return false;
-  }
-
-  Serial.println("Da khoi tao 3 VL53L0X voi dia chi rieng.");
-  return true;
-}
-
-int readDistanceMM(Adafruit_VL53L0X &sensor) {
-  VL53L0X_RangingMeasurementData_t measure;
-  sensor.rangingTest(&measure, false);
-
-  if (measure.RangeStatus == 4) {
-    return 8190; // ngoai tam do, coi nhu rat xa
-  }
-  return measure.RangeMilliMeter;
-}
-
-void readMazeDistances(int &leftMM, int &frontMM, int &rightMM) {
-  leftMM = readDistanceMM(vl53Left);
-  frontMM = readDistanceMM(vl53Front);
-  rightMM = readDistanceMM(vl53Right);
-}
-
-// ===================== MPU6050 / GYRO =====================
-
-bool setupMPU6050() {
-  if (!mpu.begin(0x68, &Wire)) {
-    return false;
-  }
-
-  mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
-  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
-  return true;
-}
-
-void calibrateGyroZ() {
-  const int samples = 500;
-  float sum = 0.0f;
-
-  Serial.println("Dang calib gyro Z, giu robot dung yen...");
-  for (int i = 0; i < samples; i++) {
-    sensors_event_t a, g, temp;
-    mpu.getEvent(&a, &g, &temp);
-    sum += g.gyro.z;
-    delay(3);
-  }
-
-  gyroZOffsetRad = sum / samples;
-  Serial.print("Gyro Z offset rad/s: ");
-  Serial.println(gyroZOffsetRad, 6);
-}
-
-void updateGyroHeading() {
-  if (!mpuReady) {
-    return;
-  }
-
-  unsigned long now = millis();
-  if (lastGyroUpdateMs == 0) {
-    lastGyroUpdateMs = now;
-    return;
-  }
-
-  float dt = (now - lastGyroUpdateMs) / 1000.0f;
-  lastGyroUpdateMs = now;
-
-  sensors_event_t a, g, temp;
-  mpu.getEvent(&a, &g, &temp);
-
-  float gyroZDegPerSec = (g.gyro.z - gyroZOffsetRad) * 57.2957795f;
-  currentHeadingDeg += gyroZDegPerSec * dt;
-}
-
-void resetHeading(float headingDeg) {
-  currentHeadingDeg = headingDeg;
-  targetHeadingDeg = headingDeg;
-  lastGyroUpdateMs = millis();
-}
-
-// ===================== LINE SENSOR / PID-PD =====================
-
-void readLineSensors() {
-  for (int i = 0; i < NUM_LINE_SENSORS; i++) {
-    lineValues[i] = analogRead(linePins[i]);
-    lineIsBlack[i] = lineValues[i] < lineThresholds[i];
-  }
-}
-
-float calculateLineError() {
-  // Trong so tu trai sang phai: -3500 .. +3500
-  const int weights[NUM_LINE_SENSORS] = {
-    -3500, -2500, -1500, -500, 500, 1500, 2500, 3500
-  };
-
-  long weightedSum = 0;
-  long activeSum = 0;
-
-  for (int i = 0; i < NUM_LINE_SENSORS; i++) {
-    int blackStrength = lineThresholds[i] - lineValues[i];
-    if (blackStrength > 0) {
-      weightedSum += (long)weights[i] * blackStrength;
-      activeSum += blackStrength;
-    }
-  }
-
-  if (activeSum == 0) {
-    return lastLineError; // mat line thi giu huong sua loi gan nhat
-  }
-
-  float error = (float)weightedSum / (float)activeSum;
-  lastLineError = error;
-  return error;
-}
-
-bool allSensorsBlack() {
-  for (int i = 0; i < NUM_LINE_SENSORS; i++) {
-    if (!lineIsBlack[i]) {
-      return false;
-    }
-  }
-  return true;
-}
-
-void followLine() {
-  float previousError = lastLineError;
-  float error = calculateLineError();
-  float derivative = error - previousError;
-
-  // Neu line o gan giua, dung gyro de giu huong thang hon.
-  float gyroCorrection = 0.0f;
-  if (abs(error) < 350.0f) {
-    gyroCorrection = (currentHeadingDeg - targetHeadingDeg) * straightGyroKp;
-  } else {
-    targetHeadingDeg = currentHeadingDeg;
-  }
-
-  float correction = lineKp * error + lineKd * derivative + gyroCorrection;
-
-  int leftSpeed = baseSpeedLine + (int)correction;
-  int rightSpeed = baseSpeedLine - (int)correction;
-
-  setMotors(constrain(leftSpeed, -255, 255), constrain(rightSpeed, -255, 255));
-}
-
-// ===================== MAZE SOLVER =====================
-
-void solveMaze() {
-  if (!vl53Ready) {
-    stopMotors();
-    Serial.println("Maze: chua co VL53L0X, dung robot.");
-    delay(300);
-    return;
-  }
-
-  int leftMM, frontMM, rightMM;
-  readMazeDistances(leftMM, frontMM, rightMM);
-
-  bool leftClear = leftMM > WALL_DISTANCE_MM;
-  bool frontClear = frontMM > FRONT_CLEAR_DISTANCE_MM;
-  bool rightClear = rightMM > WALL_DISTANCE_MM;
-
-  Serial.print("VL53 L/F/R mm: ");
-  Serial.print(leftMM);
-  Serial.print(" / ");
-  Serial.print(frontMM);
-  Serial.print(" / ");
-  Serial.println(rightMM);
-
-  if (leftClear) {
-    Serial.println("Maze: trai trong -> re trai");
-    turnLeft90();
-    goForwardMaze();
-  } else if (frontClear) {
-    Serial.println("Maze: truoc trong -> di thang");
-    goForwardMaze();
-  } else if (rightClear) {
-    Serial.println("Maze: phai trong -> re phai");
-    turnRight90();
-    goForwardMaze();
-  } else {
-    Serial.println("Maze: ca 3 huong bi chan -> quay dau");
-    turnAround180();
-  }
-}
-
-void goForwardMaze() {
-  resetHeading(0.0f);
-  unsigned long start = millis();
-
-  while (millis() - start < MAZE_FORWARD_MS) {
-    updateGyroHeading();
-    int frontMM = readDistanceMM(vl53Front);
-    if (frontMM < 80) {
-      break;
-    }
-
-    float correction = currentHeadingDeg * straightGyroKp;
-    int leftSpeed = baseSpeedMaze - (int)correction;
-    int rightSpeed = baseSpeedMaze + (int)correction;
-    setMotors(constrain(leftSpeed, -255, 255), constrain(rightSpeed, -255, 255));
-    delay(5);
-  }
-
-  stopMotors();
-  delay(80);
-}
-
-void turnLeft90() {
-  turnByDegrees(-90.0f);
-}
-
-void turnRight90() {
-  turnByDegrees(90.0f);
-}
-
-void turnAround180() {
-  turnByDegrees(180.0f);
-}
-
-void turnByDegrees(float degrees) {
-  resetHeading(0.0f);
-  int direction = degrees > 0 ? 1 : -1;
-  float target = abs(degrees);
-  unsigned long start = millis();
-
-  while (abs(currentHeadingDeg) < target && millis() - start < 3000) {
-    updateGyroHeading();
-
-    float remaining = target - abs(currentHeadingDeg);
-    int speed = turnSpeedMaze;
-    if (remaining < 25.0f) {
-      speed = 80; // giam toc gan goc dich
-    }
-
-    // Gia dinh gyro Z duong khi robot quay phai. Neu nguoc, doi dau 2 dong duoi.
-    setMotors(direction * speed, -direction * speed);
-    delay(5);
-  }
-
-  stopMotors();
-  delay(120);
-  resetHeading(0.0f);
-}
-
-// ===================== DEBUG SERIAL =====================
-
-void printLineDebug() {
-  Serial.print("Line analog: ");
-  for (int i = 0; i < NUM_LINE_SENSORS; i++) {
-    Serial.print(lineValues[i]);
-    if (i < NUM_LINE_SENSORS - 1) Serial.print(", ");
-  }
-
-  Serial.print(" | BW: ");
-  for (int i = 0; i < NUM_LINE_SENSORS; i++) {
-    Serial.print(lineIsBlack[i] ? "D" : "T"); // D = den, T = trang
-    if (i < NUM_LINE_SENSORS - 1) Serial.print(" ");
-  }
-
-  Serial.print(" | lineError: ");
-  Serial.print(lastLineError);
-  Serial.print(" | heading: ");
-  Serial.println(currentHeadingDeg);
-}
-
-void printModeDebug() {
-  Serial.print("Mode: ");
-  Serial.println(currentMode == LINE_FOLLOW_MODE ? "LINE_FOLLOW_MODE" : "MAZE_SOLVE_MODE");
-}
